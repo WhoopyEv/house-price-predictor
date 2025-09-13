@@ -7,6 +7,7 @@ from sklearn.compose import ColumnTransformer
 from sklearn.preprocessing import OneHotEncoder
 from sklearn.pipeline import Pipeline
 from sklearn.impute import SimpleImputer
+# Se usa principalmente para guardar y cargar objetos de Python de forma eficiente
 import joblib
 
 # Set up logging
