@@ -1,0 +1,169 @@
+# Nombre del flujo de trabajo
+name: MLOps Pipeline
+
+# Eventos que disparan el workflow
+on:
+  workflow_dispatch:  # Permite ejecutar el workflow manualmente desde GitHub
+    inputs:           # Entradas opcionales para controlar qué jobs ejecutar
+      run_all:
+        description: 'Run all jobs'
+        required: false
+        default: 'true'
+      run_data_processing:
+        description: 'Run data processing job'
+        required: false
+        default: 'false'
+      run_model_training:
+        description: 'Run model training job'
+        required: false
+        default: 'false'
+      run_build_and_publish:
+        description: 'Run build and publish job'
+        required: false
+        default: 'false'
+  release:  # Se ejecuta automáticamente al crear un release
+    types: [created]
+    branches: [ main ]
+    tags: [ 'v*.*.*' ]  # Solo para releases con tags que sigan el formato vX.X.X
+
+# Definición de jobs
+jobs:
+  data-processing:  # Job para procesamiento de datos
+    runs-on: ubuntu-latest  # Ejecutar en un runner Ubuntu
+
+    steps:
+    - name: Checkout code  # Clonar el repositorio
+      uses: actions/checkout@v2
+      
+    - name: Set up Python  # Configurar Python
+      uses: actions/setup-python@v2
+      with:
+        python-version: '3.11.9'
+        
+    - name: Install dependencies  # Instalar dependencias
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        
+    - name: Process data  # Ejecutar script de procesamiento de datos
+      run: |
+        python src/data/run_processing.py --input data/raw/house_data.csv --output data/processed/cleaned_house_data.csv 
+        
+    - name: Engineer features  # Ejecutar ingeniería de características
+      run: |
+        python src/features/engineer.py --input data/processed/cleaned_house_data.csv --output data/processed/featured_house_data.csv --preprocessor models/trained/preprocessor.pkl
+        
+    - name: Upload processed data  # Guardar el dataset procesado como artefacto
+      uses: actions/upload-artifact@v4
+      with:
+        name: processed-data
+        path: data/processed/featured_house_data.csv
+        
+    - name: Upload preprocessor  # Guardar preprocesador entrenado como artefacto
+      uses: actions/upload-artifact@v4
+      with:
+        name: preprocessor
+        path: models/trained/preprocessor.pkl
+        
+  model-training:  # Job para entrenamiento del modelo
+    needs: data-processing  # Depende del job de procesamiento de datos
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v2
+      
+    - name: Set up Python
+      uses: actions/setup-python@v2
+      with:
+        python-version: '3.11.9'
+        
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        
+    - name: Download processed data  # Descargar dataset procesado del job anterior
+      uses: actions/download-artifact@v4
+      with:
+        name: processed-data
+        path: data/processed/
+        
+    - name: Set up MLflow  # Levantar servidor MLflow en Docker
+      run: |
+        docker pull ghcr.io/mlflow/mlflow:latest
+        docker run -d -p 5000:5000 --name mlflow-server ghcr.io/mlflow/mlflow:latest mlflow server --host 0.0.0.0 --backend-store-uri sqlite:///mlflow.db
+        
+    - name: Wait for MLflow to start  # Esperar a que MLflow esté listo
+      run: |
+        for i in {1..10}; do
+          curl -f http://localhost:5000/health || sleep 5;
+        done
+        
+    - name: Train model  # Entrenar el modelo usando los datos procesados
+      run: |
+        mkdir -p models
+        python src/models/train_model.py --config configs/model_config.yaml --data data/processed/featured_house_data.csv --models-dir models --mlflow-tracking-uri http://localhost:5000
+        
+    - name: Upload trained model  # Guardar el modelo entrenado como artefacto
+      uses: actions/upload-artifact@v4
+      with:
+        name: trained-model
+        path: models/
+        
+    - name: Clean up MLflow  # Detener y eliminar el contenedor de MLflow
+      run: |
+        docker stop mlflow-server || true
+        docker rm mlflow-server || true
+        
+  build-and-publish:  # Job para construir la imagen Docker y publicarla
+    needs: model-training  # Depende del job de entrenamiento
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v2
+      
+    - name: Download trained model  # Descargar el modelo entrenado
+      uses: actions/download-artifact@v4
+      with:
+        name: trained-model
+        path: models/
+        
+    - name: Download preprocessor  # Descargar preprocesador
+      uses: actions/download-artifact@v4
+      with:
+        name: preprocessor
+        path: models/trained/
+        
+    - name: Set up Docker Buildx  # Configurar Docker Buildx para builds multiplataforma
+      uses: docker/setup-buildx-action@v1
+      
+    - name: Build and test Docker image  # Construir y probar imagen Docker
+      run: |
+        COMMIT_HASH=$(echo ${{ github.sha }} | cut -c1-7)  # Hash corto del commit
+        docker build -t docker.io/${{ vars.DOCKERHUB_USERNAME }}/house-price-model:$COMMIT_HASH -f Dockerfile .
+        docker run -d -p 8000:8000 --name test-api docker.io/${{ vars.DOCKERHUB_USERNAME }}/house-price-model:$COMMIT_HASH
+        for i in {1..10}; do
+          curl -f http://localhost:8000/health && break || sleep 5;
+        done
+        docker logs test-api
+
+    - name: Clean up Test Container  # Limpiar contenedor de prueba
+      run: |
+        docker stop test-api || true
+        docker rm test-api || true
+      
+    - name: Log in to GitHub Container Registry  # Login a DockerHub
+      uses: docker/login-action@v2
+      with:
+        registry: docker.io
+        username: ${{ vars.DOCKERHUB_USERNAME }}
+        password: ${{ secrets.DOCKERHUB_TOKEN }}
+     
+    - name: Push Docker image to DockerHub  # Subir la imagen a DockerHub
+      run: |
+        COMMIT_HASH=$(echo ${{ github.sha }} | cut -c1-7)
+        docker tag docker.io/${{ vars.DOCKERHUB_USERNAME }}/house-price-model:$COMMIT_HASH docker.io/${{ vars.DOCKERHUB_USERNAME }}/house-price-model:latest
+        docker push docker.io/${{ vars.DOCKERHUB_USERNAME }}/house-price-model:$COMMIT_HASH
+        docker push docker.io/${{ vars.DOCKERHUB_USERNAME }}/house-price-model:latest
